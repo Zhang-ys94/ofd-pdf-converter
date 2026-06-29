@@ -111,6 +111,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC"
   if (typeof JSZip === 'undefined') missing.push('JSZip');
   if (typeof jspdf === 'undefined') missing.push('jsPDF');
   if (typeof pdfjsLib === 'undefined') missing.push('pdf.js');
+	  if (typeof liteofd === 'undefined') missing.push('liteofd');
   if (missing.length > 0) {
     var el = document.getElementById('resultMsg');
     el.innerHTML = '库加载失败: ' + missing.join(', ') + '<br><small>请刷新页面重试</small>';
