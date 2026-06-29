@@ -97,13 +97,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC"
     <div class="result" id="resultMsg"></div>
     <div class="actions" id="downloadActions" style="display:none; margin-top: 12px;"></div>
   </div>
-  <div class="footer">基于 liteofd + pdf.js + jsPDF 构建 · 纯浏览器端</div>
+  <div class="footer">基于 JSZip + pdf.js + jsPDF 构建 · 纯浏览器端</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
-<script src="liteofd-bundle.js"></script>
 <script>
 // ── 库加载检测 ──
 (function() {
@@ -111,8 +110,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC"
   if (typeof JSZip === 'undefined') missing.push('JSZip');
   if (typeof jspdf === 'undefined') missing.push('jsPDF');
   if (typeof pdfjsLib === 'undefined') missing.push('pdf.js');
-	  if (typeof liteofd === 'undefined') missing.push('liteofd');
-  if (missing.length > 0) {
+	    if (missing.length > 0) {
     var el = document.getElementById('resultMsg');
     el.innerHTML = '库加载失败: ' + missing.join(', ') + '<br><small>请刷新页面重试</small>';
     el.className = 'result error';
@@ -299,105 +297,232 @@ async function convertFile(file, direction) {
   }
 }
 
-// ── OFD → PDF（liteofd 渲染 + jsPDF 输出） ──
-async function ofdToPdf(file) {
-  var liteOfd = new liteofd.LiteOfd();
-  var ofdDoc;
-  try {
-    ofdDoc = await liteOfd.parse(file);
-  } catch (e) {
-    throw new Error("OFD 解析失败: " + (e.message || e));
+// ── OFD XML 解析辅助（处理命名空间前缀 ofd:） ──
+function parseXml(text) {
+  return new DOMParser().parseFromString(text, 'text/xml');
+}
+
+function byLocalName(parent, localName) {
+  var result = [];
+  var all = parent.getElementsByTagName('*');
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].localName === localName) result.push(all[i]);
   }
+  return result;
+}
 
-  var pages = ofdDoc.pages;
-  if (!pages || !pages.length) throw new Error("OFD 文档中无页面");
+function firstByName(parent, localName) {
+  var els = byLocalName(parent, localName);
+  return els.length > 0 ? els[0] : null;
+}
 
-  var pdf = new jspdf.jsPDF({ unit: "pt" });
+function textByName(parent, localName) {
+  var el = firstByName(parent, localName);
+  return el ? el.textContent.trim() : '';
+}
+
+// ── OFD → PDF（JSZip + DOMParser 手动渲染） ──
+async function ofdToPdf(file) {
+  // 步骤1: 解压 OFD ZIP
+  var zip;
+  try { zip = await JSZip.loadAsync(file); } catch (e) { throw new Error('OFD 文件解压失败（非有效 ZIP 格式）'); }
+
+  // 步骤2: 解析 OFD.xml
+  var ofdXmlText;
+  try { ofdXmlText = await zip.file('OFD.xml').async('string'); } catch (e) { throw new Error('OFD.xml 不存在，非有效 OFD 文件'); }
+  var ofdXml = parseXml(ofdXmlText);
+  if (ofdXml.querySelector('parsererror')) throw new Error('OFD.xml 解析失败');
+
+  var docRootEl = firstByName(ofdXml, 'DocRoot');
+  if (!docRootEl) throw new Error('OFD.xml 找不到 DocRoot');
+  var docRoot = docRootEl.textContent.trim();
+  if (docRoot.charAt(0) === '/') docRoot = docRoot.substring(1);
+  var slashIdx = docRoot.indexOf('/');
+  var docBase = slashIdx > 0 ? docRoot.substring(0, slashIdx) : 'Doc_0';
+
+  // 步骤3: 解析 Document.xml 获取页面列表和尺寸
+  var docXmlText;
+  try { docXmlText = await zip.file(docRoot).async('string'); } catch (e) { throw new Error(docRoot + ' 不存在'); }
+  var docXml = parseXml(docXmlText);
+  if (docXml.querySelector('parsererror')) throw new Error(docRoot + ' 解析失败');
+
+  var pageNodes = byLocalName(docXml, 'Page');
+  if (!pageNodes.length) throw new Error('文档中无页面');
+
+  var commonData = firstByName(docXml, 'CommonData');
+  var physBoxText = textByName(commonData, 'PhysicalBox') || '0 0 210 297';
+  var physBox = physBoxText.split(/\s+/).map(Number);
+  var defaultPageW = (physBox[2] || 210) - (physBox[0] || 0);
+  var defaultPageH = (physBox[3] || 297) - (physBox[1] || 0);
+
+  // 步骤4: 解析 DocumentRes.xml 获取图片资源映射
+  var resources = {};
+  var resBase = 'Res';
+  try {
+    var resXmlText = await zip.file(docBase + '/DocumentRes.xml').async('string');
+    var resXml = parseXml(resXmlText);
+    var resEl = firstByName(resXml, 'Res');
+    if (resEl) {
+      var rbl = resEl.getAttribute('BaseLoc');
+      if (rbl) {
+        if (rbl.charAt(0) === '/') rbl = rbl.substring(1);
+        resBase = rbl;
+      }
+    }
+    var multiMedias = byLocalName(resXml, 'MultiMedia');
+    for (var m = 0; m < multiMedias.length; m++) {
+      var mm = multiMedias[m];
+      var id = mm.getAttribute('ID');
+      var format = (mm.getAttribute('Format') || 'JPG').toLowerCase();
+      var mediaFile = textByName(mm, 'MediaFile');
+      if (id && mediaFile) resources[id] = { format: format, path: mediaFile };
+    }
+  } catch (e) { /* 无资源文件 */ }
+
+  // 步骤5: 逐页渲染到 PDF
+  var pdf = new jspdf.jsPDF({ unit: 'pt' });
   var scale = 2;
 
-  for (var i = 0; i < pages.length; i++) {
-    var page = pages[i];
-    var physBox = (page.pageArea && page.pageArea.physicalBox) ? page.pageArea.physicalBox : [0, 0, 210, 297];
-    var pwMM = (physBox[2] || 210) - (physBox[0] || 0);
-    var phMM = (physBox[3] || 297) - (physBox[1] || 0);
-    var pageW = pwMM * 72 / 25.4;
-    var pageH = phMM * 72 / 25.4;
+  for (var i = 0; i < pageNodes.length; i++) {
+    var pageNode = pageNodes[i];
+    var pageBaseLoc = pageNode.getAttribute('BaseLoc');
+    if (!pageBaseLoc) throw new Error('第 ' + (i + 1) + ' 页缺少 BaseLoc 属性');
+    if (pageBaseLoc.charAt(0) === '/') pageBaseLoc = pageBaseLoc.substring(1);
 
-    var pageDiv;
-    try {
-      pageDiv = liteOfd.renderPage(i, "background-color: white;");
-    } catch (e) {
-      throw new Error("第 " + (i + 1) + " 页渲染失败: " + (e.message || e));
+    var contentPath = docBase + '/' + pageBaseLoc;
+    var contentXmlText;
+    try { contentXmlText = await zip.file(contentPath).async('string'); } catch (e) { throw new Error('第 ' + (i + 1) + ' 页内容文件不存在: ' + contentPath); }
+    var contentXml = parseXml(contentXmlText);
+
+    // 页面物理尺寸
+    var pageEl = firstByName(contentXml, 'Page') || docXml.documentElement;
+    var pageAreaText = textByName(pageEl, 'PhysicalBox');
+    var pageW, pageH;
+    if (pageAreaText) {
+      var pa = pageAreaText.split(/\s+/).map(Number);
+      pageW = ((pa[2] || defaultPageW) - (pa[0] || 0)) * 72 / 25.4;
+      pageH = ((pa[3] || defaultPageH) - (pa[1] || 0)) * 72 / 25.4;
+    } else {
+      pageW = defaultPageW * 72 / 25.4;
+      pageH = defaultPageH * 72 / 25.4;
     }
 
-    var container = document.createElement("div");
-    container.style.cssText = "position:absolute;left:-9999px;top:0;";
-    container.appendChild(pageDiv);
-    document.body.appendChild(container);
+    // 创建离屏 canvas
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.round(pageW * scale);
+    canvas.height = Math.round(pageH * scale);
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    try {
-      // liteofd renders SVGs asynchronously via setTimeout — poll until ready
-      var svgs = pageDiv.querySelectorAll("svg");
-      if (svgs.length === 0) {
-        await new Promise(function (resolve) {
-          var start = Date.now();
-          var check = function () {
-            var s = pageDiv.querySelectorAll("svg");
-            if (s.length > 0 || Date.now() - start > 5000) { resolve(); }
-            else { setTimeout(check, 15); }
+    function mmToPx(mmX, mmY) { return [mmX * scale * 72 / 25.4, mmY * scale * 72 / 25.4]; }
+
+    // 渲染 ImageObject
+    var imgObjects = byLocalName(contentXml, 'ImageObject');
+    for (var io = 0; io < imgObjects.length; io++) {
+      var imgObj = imgObjects[io];
+      var resourceId = imgObj.getAttribute('ResourceID');
+      var res2 = resources[resourceId];
+      if (!res2) continue;
+
+      var imagePath = res2.path;
+      if (imagePath.charAt(0) === '/') imagePath = imagePath.substring(1);
+      var fullImagePath;
+      if (imagePath.indexOf('../') === 0) {
+        imagePath = imagePath.substring(3);
+        fullImagePath = docBase + '/' + imagePath;
+      } else {
+        fullImagePath = docBase + '/' + resBase + '/' + imagePath;
+      }
+
+      var imageData;
+      try { imageData = await zip.file(fullImagePath).async('arraybuffer'); } catch (e) { continue; }
+
+      var blob = new Blob([imageData]);
+      var imageUrl = URL.createObjectURL(blob);
+      try {
+        await new Promise(function (resolve, reject) {
+          var img = new Image();
+          img.onload = function () {
+            var boundary = (imgObj.getAttribute('Boundary') || '0 0 ' + defaultPageW + ' ' + defaultPageH).split(/\s+/).map(Number);
+            var pos = mmToPx(boundary[0] || 0, boundary[1] || 0);
+            var bw = (boundary[2] || defaultPageW) - (boundary[0] || 0);
+            var bh = (boundary[3] || defaultPageH) - (boundary[1] || 0);
+            var size = mmToPx(bw, bh);
+            ctx.drawImage(img, pos[0], pos[1], size[0], size[1]);
+            resolve();
           };
-          setTimeout(check, 15);
+          img.onerror = function () { reject(new Error('第 ' + (i + 1) + ' 页图片加载失败')); };
+          img.src = imageUrl;
         });
-        svgs = pageDiv.querySelectorAll("svg");
-      }
-
-      var canvas = document.createElement("canvas");
-      canvas.width = Math.round(pageW * scale);
-      canvas.height = Math.round(pageH * scale);
-      var ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      for (var s = 0; s < svgs.length; s++) {
-        var svg = svgs[s];
-        var svgData = new XMLSerializer().serializeToString(svg);
-        var svgBlob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
-        var url = URL.createObjectURL(svgBlob);
-        try {
-          await new Promise(function (resolve, reject) {
-            var img = new Image();
-            img.onload = function () {
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              resolve();
-            };
-            img.onerror = function () { reject(new Error("SVG 转图片失败")); };
-            img.src = url;
-          });
-        } finally {
-          URL.revokeObjectURL(url);
-        }
-      }
-
-      if (svgs.length === 0) {
-        ctx.fillStyle = "#999999";
-        ctx.font = (12 * scale) + "px sans-serif";
-        ctx.fillText("（此页无可渲染内容）", 10 * scale, 20 * scale);
-      }
-
-      pdf.addPage([pageW, pageH]);
-      pdf.addImage(canvas.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, pageW, pageH);
-    } finally {
-      document.body.removeChild(container);
+      } finally { URL.revokeObjectURL(imageUrl); }
     }
+
+    // 渲染 TextObject
+    var textObjects = byLocalName(contentXml, 'TextObject');
+    for (var to = 0; to < textObjects.length; to++) {
+      var textObj = textObjects[to];
+      var textCode = firstByName(textObj, 'TextCode');
+      if (!textCode) continue;
+      var text = textCode.getAttribute('Value') || textCode.textContent || '';
+      if (!text.trim()) continue;
+
+      var boundary = (textObj.getAttribute('Boundary') || '0 0 ' + defaultPageW + ' 10').split(/\s+/).map(Number);
+      var pos = mmToPx(boundary[0] || 0, boundary[1] || 0);
+      var th = (boundary[3] || 10) - (boundary[1] || 0);
+      var tw = (boundary[2] || defaultPageW) - (boundary[0] || 0);
+      var fontSizeMM = th * 0.6;
+      var fontSize = Math.max(6, Math.min(fontSizeMM * 72 / 25.4 * scale, tw / text.length * scale * 1.2));
+      ctx.fillStyle = '#000000';
+      ctx.font = fontSize + 'px sans-serif';
+      ctx.fillText(text, pos[0], pos[1] + fontSize * 0.8);
+    }
+
+    // 渲染 PathObject (边框/线条)
+    var pathObjects = byLocalName(contentXml, 'PathObject');
+    for (var po = 0; po < pathObjects.length; po++) {
+      var pathObj = pathObjects[po];
+      var pBoundary = (pathObj.getAttribute('Boundary') || '0 0 ' + defaultPageW + ' 0').split(/\s+/).map(Number);
+      var pPos = mmToPx(pBoundary[0] || 0, pBoundary[1] || 0);
+      var pW = (pBoundary[2] || defaultPageW) - (pBoundary[0] || 0);
+      var pH = (pBoundary[3] || 0) - (pBoundary[1] || 0);
+      var lineWidth = parseFloat(pathObj.getAttribute('LineWidth')) || 1;
+      var strokeColor = textByName(pathObj, 'StrokeColor') || '#000000';
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = lineWidth * scale;
+      if (pH < 1) {
+        // 水平线
+        ctx.beginPath();
+        ctx.moveTo(pPos[0], pPos[1]);
+        ctx.lineTo(pPos[0] + mmToPx(pW, 0)[0], pPos[1]);
+        ctx.stroke();
+      } else if (pW < 1) {
+        // 垂直线
+        ctx.beginPath();
+        ctx.moveTo(pPos[0], pPos[1]);
+        ctx.lineTo(pPos[0], pPos[1] + mmToPx(0, pH)[1]);
+        ctx.stroke();
+      } else {
+        // 矩形边框
+        ctx.strokeRect(pPos[0], pPos[1], mmToPx(pW, 0)[0], mmToPx(0, pH)[1]);
+      }
+    }
+
+    if (imgObjects.length === 0 && textObjects.length === 0 && pathObjects.length === 0) {
+      ctx.fillStyle = '#999999';
+      ctx.font = (12 * scale) + 'px sans-serif';
+      ctx.fillText('（此页无可提取的内容）', 10 * scale, 20 * scale);
+    }
+
+    pdf.addPage([pageW, pageH]);
+    pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pageW, pageH);
   }
 
   pdf.deletePage(1);
-
-  var pdfBytes = pdf.output("arraybuffer");
-  var outName = file.name.replace(/.ofd$/i, "") + ".pdf";
-  return { name: outName, blob: new Blob([pdfBytes], { type: "application/pdf" }) };
+  var pdfBytes = pdf.output('arraybuffer');
+  var outName = file.name.replace(/\.ofd$/i, '') + '.pdf';
+  return { name: outName, blob: new Blob([pdfBytes], { type: 'application/pdf' }) };
 }
-
 // ── PDF → OFD ──
 async function pdfToOfd(file) {
   const arrayBuf = await file.arrayBuffer();
