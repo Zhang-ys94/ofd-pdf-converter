@@ -335,6 +335,21 @@ async function ofdToPdf(file) {
     document.body.appendChild(container);
 
     try {
+      // liteofd renders SVGs asynchronously via setTimeout — poll until ready
+      var svgs = pageDiv.querySelectorAll("svg");
+      if (svgs.length === 0) {
+        await new Promise(function (resolve) {
+          var start = Date.now();
+          var check = function () {
+            var s = pageDiv.querySelectorAll("svg");
+            if (s.length > 0 || Date.now() - start > 5000) { resolve(); }
+            else { setTimeout(check, 15); }
+          };
+          setTimeout(check, 15);
+        });
+        svgs = pageDiv.querySelectorAll("svg");
+      }
+
       var canvas = document.createElement("canvas");
       canvas.width = Math.round(pageW * scale);
       canvas.height = Math.round(pageH * scale);
@@ -342,7 +357,6 @@ async function ofdToPdf(file) {
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      var svgs = pageDiv.querySelectorAll("svg");
       for (var s = 0; s < svgs.length; s++) {
         var svg = svgs[s];
         var svgData = new XMLSerializer().serializeToString(svg);
